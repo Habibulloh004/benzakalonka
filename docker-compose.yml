@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: mediadb
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres123
+      POSTGRES_PASSWORD: postgres123 #postgres123
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # - ./init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -28,8 +28,8 @@ services:
       - DB_PORT=5432
       - DB_NAME=mediadb
       - DB_USER=postgres
-      - DB_PASSWORD=postgres123
-      - SESSION_SECRET=your-super-secret-session-key-change-this
+      - DB_PASSWORD=postgres123 #postgres123
+      - SESSION_SECRET=abf3e295f9c74d07b8efda7c8e1c5a5f7b4dff2878b94c6492b0aa6c6a83db2a
     volumes:
       - ./uploads:/app/uploads
     depends_on:
