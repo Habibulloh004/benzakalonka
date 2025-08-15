@@ -10,6 +10,36 @@ const dotenv = require("dotenv");
 
 dotenv.config();
 
+// === uploads dir: env orqali boshqarish + yozish huquqini tekshirish ===
+const UPLOADS_DIR = process.env.UPLOADS_DIR || path.resolve(__dirname, "uploads");
+
+// create dir (775) va yozish huquqini tekshirish
+try {
+  if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true, mode: 0o775 });
+  } else {
+    // mavjud bo'lsa ham, ruxsatni kengaytirib qo'yamiz (umask ta'sir qilmasligi uchun)
+    try { fs.chmodSync(UPLOADS_DIR, 0o775); } catch (_) {}
+  }
+  fs.accessSync(UPLOADS_DIR, fs.constants.W_OK);
+  console.log("✅ Uploads dir:", UPLOADS_DIR, "writable");
+} catch (e) {
+  console.error("❌ Uploads dir not writable:", UPLOADS_DIR, e.message);
+  console.error("   Fix ownership/permissions or set UPLOADS_DIR env.");
+  process.exit(1);
+}
+
+// Multer shu pathdan foydalansin
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    const name = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    cb(null, name);
+  },
+});
+
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -242,17 +272,6 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// ✅ uploadsDir oldinda yaratilgan: const uploadsDir = path.join(__dirname, "uploads");
-
-const storage = multer.diskStorage({
-  // 🔧 NISBIY YO'L O'RNIGA ABSOLYUT YO'L
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || "").toLowerCase();
-    const name = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-    cb(null, name);
-  },
-});
 
 // 📏 Limitlar + aniq fileFilter (mp4/mov/webm/… va rasm turlari)
 const upload = multer({

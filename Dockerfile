@@ -1,22 +1,19 @@
+# Dockerfile
 FROM node:18-alpine
 
-ENV NODE_ENV=production
 WORKDIR /app
 
-# Faqat lock va package fayllarini ko'chirish
-COPY package*.json ./
+# package* fayllarni ko'chirib o'rnatamiz
+COPY --chown=node:node package*.json ./
+RUN npm ci --omit=dev
 
-# Production deps
-RUN npm install --omit=dev
+# Ilova fayllari (egasi node bo'lsin)
+COPY --chown=node:node . .
 
-# Kod
-COPY . .
+# uploads papkani yaratib, node'ga beramiz
+RUN mkdir -p /app/uploads && chown -R node:node /app
 
-# Uploads papka (ruxsat bilan)
-RUN mkdir -p uploads && chown -R node:node uploads
-
-# Non-root user
 USER node
 
 EXPOSE 3000
-CMD ["npm", "start"]
+CMD ["node", "server.js"]
