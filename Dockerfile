@@ -1,21 +1,22 @@
 FROM node:18-alpine
 
+ENV NODE_ENV=production
 WORKDIR /app
 
-# Copy package files
+# Faqat lock va package fayllarini ko'chirish
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Production deps
+RUN npm install --omit=dev
 
-# Copy application code
+# Kod
 COPY . .
 
-# Create uploads directory
-RUN mkdir -p uploads
+# Uploads papka (ruxsat bilan)
+RUN mkdir -p uploads && chown -R node:node uploads
 
-# Expose port
+# Non-root user
+USER node
+
 EXPOSE 3000
-
-# Start the application
 CMD ["npm", "start"]

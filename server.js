@@ -242,54 +242,46 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Multer configuration for file uploads
+// ✅ uploadsDir oldinda yaratilgan: const uploadsDir = path.join(__dirname, "uploads");
+
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, "uploads/");
-  },
+  // 🔧 NISBIY YO'L O'RNIGA ABSOLYUT YO'L
+  destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    const name = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    cb(null, name);
   },
 });
 
+// 📏 Limitlar + aniq fileFilter (mp4/mov/webm/… va rasm turlari)
 const upload = multer({
-  storage: storage,
+  storage,
+  limits: {
+    files: 10,
+    fileSize: 2 * 1024 * 1024 * 1024, // 2GB
+  },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif|webp|mp4|avi|mov|wmv|webm|quicktime/;
-    const extname = allowedTypes.test(
-      path.extname(file.originalname).toLowerCase()
-    );
-
-    const allowedMimeTypes = [
-      "image/jpeg",
-      "image/jpg",
-      "image/png",
-      "image/gif",
-      "image/webp",
-      "video/mp4",
-      "video/avi",
-      "video/quicktime",
-      "video/x-msvideo",
-      "video/webm",
-      "video/x-ms-wmv",
-    ];
-
-    const mimetypeAllowed = allowedMimeTypes.includes(
-      file.mimetype.toLowerCase()
-    );
-
-    if (mimetypeAllowed && extname) {
-      return cb(null, true);
-    } else {
-      cb(
-        new Error(
-          "Only image (JPEG, PNG, GIF, WebP) and video (MP4, AVI, MOV, WMV, WebM) files are allowed!"
-        )
-      );
-    }
+    const okExt = /\.(jpe?g|png|gif|webp|mp4|avi|mov|wmv|webm)$/i.test(file.originalname || "");
+    const okMime = /^(image\/(jpeg|png|gif|webp)|video\/(mp4|x-msvideo|quicktime|x-ms-wmv|webm))$/i
+      .test(file.mimetype || "");
+    return (okExt && okMime)
+      ? cb(null, true)
+      : cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "Unsupported file type"));
   },
 });
+
+// ✅ Multer ni route ichida qo‘llab, xatoni ushlaydigan wrapper
+const uploadMiddleware = (req, res, next) => {
+  upload.array("media", 10)(req, res, (err) => {
+    if (err) {
+      console.error("Multer upload error:", err);
+      return res.redirect("/admin?upload_error=1"); // 500 o‘rniga foydalanuvchi uchun xabar
+    }
+    next();
+  });
+};
+
 
 // Middleware to check admin authentication
 const requireAuth = (req, res, next) => {
@@ -3070,7 +3062,7 @@ app.post("/api/tv/:tvId/timing", async (req, res) => {
 app.post(
   "/admin/upload",
   requireAuth,
-  upload.array("media", 10),
+  uploadMiddleware,
   async (req, res) => {
     try {
       if (!req.files || req.files.length === 0) {
