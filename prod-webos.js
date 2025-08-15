@@ -1,6 +1,5 @@
 const express = require("express");
 const session = require("express-session");
-const compression = require("compression");
 const multer = require("multer");
 const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
@@ -13,8 +12,6 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(compression());
-
 // Database configuration
 const pool = new Pool({
   user: process.env.DB_USER || "postgres",
@@ -24,108 +21,24 @@ const pool = new Pool({
   port: process.env.DB_PORT || 5432,
 });
 
-// ✅ MEDIA (rasm/video) uchun kuchli kesh + Range qo'llab-quvvatlash
-app.head("/uploads/:filename", mediaHandler); // HEAD
-app.get("/uploads/:filename", mediaHandler);  // GET
-
-function mediaHandler(req, res) {
-  const filename = req.params.filename;
-  const filePath = path.join(__dirname, "uploads", filename);
-
-  if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
-
-  const stat = fs.statSync(filePath);
-  const size = stat.size;
-  const ext = path.extname(filename).toLowerCase();
-  const range = req.headers.range;
-
-  const mime = {
-    ".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",".gif":"image/gif",".webp":"image/webp",".avif":"image/avif",".svg":"image/svg+xml",
-    ".mp4":"video/mp4",".webm":"video/webm",".avi":"video/x-msvideo",".mov":"video/quicktime",".wmv":"video/x-ms-wmv"
-  }[ext] || "application/octet-stream";
-
-  const isVideo = mime.startsWith("video/");
-  const isImage = mime.startsWith("image/");
-
-  // ETag (weak) + Last-Modified
-  const etag = `W/"${stat.mtime.getTime()}-${size}"`;
-  const lastMod = stat.mtime.toUTCString();
-
-  // Rasmlar: fayl nomlari random/unique bo'lgani uchun 1 yil + immutable
-  // Videolar: 1 soat + must-revalidate (range oqimida xavfsizroq)
-  const cacheCtl = isImage
-    ? "public, max-age=31536000, immutable"
-    : isVideo
-      ? "public, max-age=3600, must-revalidate"
-      : "public, max-age=86400, must-revalidate";
-
-  // 304 sharti (range bo'lmaganda)
-  if (!range && req.method !== "HEAD") {
-    const inm = req.headers["if-none-match"];
-    const ims = req.headers["if-modified-since"];
-    if (inm === etag || (ims && new Date(ims) >= stat.mtime)) {
-      res.writeHead(304, {
-        "Cache-Control": cacheCtl,
-        "ETag": etag,
-        "Last-Modified": lastMod,
-        "Content-Type": mime,
-        "Accept-Ranges": isVideo ? "bytes" : "none",
-        "X-Content-Type-Options": "nosniff",
-      });
-      return res.end();
-    }
-  }
-
-  // HEAD – faqat header
-  if (req.method === "HEAD") {
-    res.writeHead(200, {
-      "Content-Length": size,
-      "Content-Type": mime,
-      "Cache-Control": cacheCtl,
-      "ETag": etag,
-      "Last-Modified": lastMod,
-      "Accept-Ranges": isVideo ? "bytes" : "none",
-      "X-Content-Type-Options": "nosniff",
-    });
-    return res.end();
-  }
-
-  // VIDEO: Range qo'llab-quvvatlash
-  if (range && isVideo) {
-    const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(startStr, 10);
-    const end = endStr ? parseInt(endStr, 10) : size - 1;
-    if (isNaN(start) || start >= size) return res.status(416).set("Content-Range", `bytes */${size}`).end();
-    const chunk = (end - start) + 1;
-
-    res.writeHead(206, {
-      "Content-Range": `bytes ${start}-${end}/${size}`,
-      "Accept-Ranges": "bytes",
-      "Content-Length": chunk,
-      "Content-Type": mime,
-      "Cache-Control": cacheCtl,
-      "ETag": etag,
-      "Last-Modified": lastMod,
-      "X-Content-Type-Options": "nosniff",
-      // CORS kerak bo'lsa yoqing:
-      // "Access-Control-Allow-Origin": "*",
-    });
-    return fs.createReadStream(filePath, { start, end }).pipe(res);
-  }
-
-  // Rasm yoki to'liq video (range-siz)
-  res.writeHead(200, {
-    "Content-Length": size,
-    "Content-Type": mime,
-    "Cache-Control": cacheCtl,
-    "ETag": etag,
-    "Last-Modified": lastMod,
-    "Accept-Ranges": isVideo ? "bytes" : "none",
-    "X-Content-Type-Options": "nosniff",
-  });
-  fs.createReadStream(filePath).pipe(res);
-}
-
+app.use(
+  "/uploads",
+  (req, res, next) => {
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.setHeader("Accept-Ranges", "bytes");
+    next();
+  },
+  express.static(path.join(__dirname, "uploads"), {
+    maxAge: "365d",
+    etag: true,
+    immutable: true,
+    setHeaders: (res, filePath) => {
+      // MIME to'g'ri bo'lsin (kerak bo'lsa)
+      if (filePath.endsWith(".mp4")) res.setHeader("Content-Type", "video/mp4");
+      if (filePath.endsWith(".webm")) res.setHeader("Content-Type", "video/webm");
+    },
+  })
+);
 
 // Function to initialize database and create admin user
 async function initializeDatabase() {
@@ -242,6 +155,17 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
+// Static files with caching
+app.use(
+  "/uploads",
+  express.static("uploads", {
+    maxAge: "1d", // Cache for 1 day
+    etag: true,
+    lastModified: true,
+  })
+);
+app.use(express.static("public"));
+
 // Multer configuration for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -305,9 +229,6 @@ const requireAuth = (req, res, next) => {
 
 // Enhanced Admin Dashboard Route - Complete Fixed Version
 app.get("/admin", requireAuth, async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
   try {
     const mediaResult = await pool.query(
       "SELECT * FROM media ORDER BY display_order ASC, upload_date DESC"
@@ -1777,9 +1698,6 @@ app.get("/admin", requireAuth, async (req, res) => {
 // Fixed TV display route - Replace the existing /tv/:tvId route in server.js
 
 app.get("/tv/:tvId", async (req, res) => {
-  res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
   try {
     const tvId = req.params.tvId;
 
@@ -2182,391 +2100,575 @@ app.get("/tv/:tvId", async (req, res) => {
           </div>
           
           <script>
-            /* ====== KARUSEL / VIDEO AUDIO AUTO-NAZORAT (reload-safe) ====== */
-            const items = document.querySelectorAll('.carousel-item');
-            let currentIndex = 0;
-            let transitionTime = ${tv.image_transition_time}; // ms
-            let carouselTimer = null;
-            const POLL_MS = 500;
+              const items = document.querySelectorAll('.carousel-item');
+              let currentIndex = 0;
+              let transitionTime = ${tv.image_transition_time};
+              let mediaAssignments = {};
+              let availableSortable = null;
+              let assignedSortable = null;
+              let carouselTimer = null;
+              let userHasInteracted = false;
 
-            function hardMute(v){ if(!v) return; v.muted = true; if(!v.hasAttribute('muted')) v.setAttribute('muted',''); }
-            function hardUnmute(v){ if(!v) return; v.muted = false; v.removeAttribute('muted'); v.volume = 1; }
-
-            // Audio bor-yo‘qligi (heuristika)
-            function hasAudio(v){
-              try{
-                if (typeof v.mozHasAudio !== 'undefined') return !!v.mozHasAudio;
-                if (v.audioTracks && v.audioTracks.length) return true;
-                if (typeof v.webkitAudioDecodedByteCount !== 'undefined') return v.webkitAudioDecodedByteCount > 0;
-              }catch(e){}
-              return v.dataset.hasAudio === '1';
+              function stopAllVideosExcept(exceptIndex = -1) {
+                items.forEach((item, index) => {
+                    if (index !== exceptIndex && item.dataset.type === 'video') {
+                        const video = item.querySelector('video');
+                        if (video) {
+                            video.pause();
+                            video.currentTime = 0;
+                        }
+                    }
+                });
             }
-            function tagAudioPresence(v){
-              try{
-                if (v.audioTracks && v.audioTracks.length) { v.dataset.hasAudio = '1'; return; }
-                if (typeof v.mozHasAudio !== 'undefined') { v.dataset.hasAudio = v.mozHasAudio ? '1' : '0'; return; }
-                if (typeof v.webkitAudioDecodedByteCount !== 'undefined') v.dataset.hasAudio = v.webkitAudioDecodedByteCount > 0 ? '1' : '0';
-              }catch(e){}
-            }
-
-            function stopAllVideosExcept(exceptIndex){
-              items.forEach((item, idx) => {
-                if (idx === exceptIndex) return;
-                if (item.dataset.type === 'video'){
-                  const v = item.querySelector('video');
-                  if (!v) return;
-                  hardMute(v);
-                  v.pause();
-                  v.currentTime = 0;
-                }
+              
+            function prepareVideo(video) {
+              return new Promise((resolve, reject) => {
+                  // First ensure video is stopped
+                  video.pause();
+                  video.currentTime = 0;
+                  
+                  // Remove any existing event listeners
+                  video.onloadeddata = null;
+                  video.oncanplay = null;
+                  video.onerror = null;
+                  
+                  const handleCanPlay = () => {
+                      video.oncanplay = null;
+                      video.onerror = null;
+                      resolve();
+                  };
+                  
+                  const handleError = () => {
+                      video.oncanplay = null;
+                      video.onerror = null;
+                      reject(new Error('Video failed to load'));
+                  };
+                  
+                  video.oncanplay = handleCanPlay;
+                  video.onerror = handleError;
+                  
+                  // Force reload
+                  // video.load();
+                  
+                  // Timeout fallback
+                  setTimeout(() => {
+                      video.oncanplay = null;
+                      video.onerror = null;
+                      resolve(); // Resolve anyway to continue carousel
+                  }, 5000);
               });
-            }
-
-            function isActuallyPlaying(v){ return v && v.currentTime > 0 && !v.paused && !v.ended && v.readyState >= 2; }
-
-            // metadata ni kutish – hang bo‘lib qolmasin, timeout qo‘shamiz
-            function waitForMeta(v, timeout=1200){
-              if (v.readyState >= 1) return Promise.resolve();
-              return new Promise(res => {
-                let done = false;
-                const onMeta = () => { if (done) return; done = true; v.removeEventListener('loadedmetadata', onMeta); res(); };
-                v.addEventListener('loadedmetadata', onMeta);
-                try { v.load(); } catch(e){}
-                setTimeout(() => { if (done) return; done = true; v.removeEventListener('loadedmetadata', onMeta); res(); }, timeout);
-              });
-            }
-
-            // bir urinishda to‘g‘ri rejimni tanlab play qilish
-            async function safePlay(v, wantAudible){
-              try{
-                if (wantAudible) hardUnmute(v); else hardMute(v);
-                await v.play();
-                // kichik "jolt" – ba’zi brauzerlar audio dekoderini uyg‘otadi
-                try { v.currentTime = Math.max(0, v.currentTime + 0.001); } catch(e){}
-                return true;
-              }catch(err){
-                // Autoplay siyosati bloklasa: muted holda o‘ynatib yuboramiz
-                try{
-                  hardMute(v);
-                  await v.play();
-                }catch(_){}
-                return false; // audible ga o‘ta olmadik
+          }
+              function forceVideoLoad(video) {
+                return new Promise((resolve, reject) => {
+                  video.pause();
+                  video.currentTime = 0;
+                  video.load(); // always reload the element
+              
+                  const handleCanPlay = () => {
+                    video.removeEventListener('canplay', handleCanPlay);
+                    video.removeEventListener('error', handleError);
+                    resolve();
+                  };
+              
+                  const handleError = () => {
+                    video.removeEventListener('canplay', handleCanPlay);
+                    video.removeEventListener('error', handleError);
+                    reject(new Error('Video failed to load'));
+                  };
+              
+                  video.addEventListener('canplay', handleCanPlay);
+                  video.addEventListener('error', handleError);
+              
+                  setTimeout(() => {
+                    video.removeEventListener('canplay', handleCanPlay);
+                    video.removeEventListener('error', handleError);
+                    reject(new Error('Video load timeout'));
+                  }, 5000);
+                });
               }
-            }
-
-            // agar bloklangan bo‘lsa – 500ms da bir audible ga o‘tkazishga urinish
-            const needsAudibleRetry = new WeakMap();
-            function tryMakeAudible(v){
-              try{
-                hardUnmute(v);
-                try { v.currentTime = Math.max(0, v.currentTime + 0.001); } catch(e){}
-                const p = v.play();
-                if (p && typeof p.catch === 'function'){
-                  p.catch(() => { hardMute(v); }); // keyingi poll’da yana uriniladi
+              
+              
+              async function playVideo(video) {
+                try {
+                    await prepareVideo(video);
+                    
+                    // Try to play with sound if user has interacted
+                    if (userHasInteracted) {
+                        video.muted = false;
+                    } else {
+                        video.muted = true;
+                    }
+                    
+                    const playPromise = video.play();
+                    if (playPromise !== undefined) {
+                        await playPromise;
+                        return true;
+                    }
+                    return true;
+                } catch (error) {
+                    console.warn('Video play failed:', error);
+                    
+                    // Fallback to muted play
+                    try {
+                        video.muted = true;
+                        await video.play();
+                        return true;
+                    } catch (mutedError) {
+                        console.error('Even muted play failed:', mutedError);
+                        return false;
+                    }
                 }
-              }catch(e){}
-            }
-
-            async function decideAndPlay(v){
-              // inline/autoplay atributlarini qat’iy qo‘yamiz – mobil/safari uchun
-              v.setAttribute('playsinline','');
-              v.setAttribute('webkit-playsinline','');
-              v.setAttribute('autoplay','');
-              v.controls = false;
-              v.disablePictureInPicture = true;
-
-              await waitForMeta(v, 1200);
-              tagAudioPresence(v);
-              const wantAudible = hasAudio(v);
-              const okAudible = await safePlay(v, wantAudible);
-              needsAudibleRetry.set(v, wantAudible && !okAudible);
-              return { wantAudible };
-            }
-
-            async function startCurrent(){
-              const item = items[currentIndex];
-              if (!item) return;
-
-              if (item.dataset.type !== 'video'){
-                if (items.length > 1) carouselTimer = setTimeout(showNextItem, transitionTime);
-                return;
-              }
-
-              const v = item.querySelector('video');
-              if (!v) return;
-
-              const { wantAudible } = await decideAndPlay(v);
-
-              v.onended = () => {
-                if (items.length > 1) showNextItem();
-                else { v.currentTime = 0; v.play().catch(()=>{}); }
-              };
-            }
-
-            function showNextItem(){
-              if (carouselTimer){ clearTimeout(carouselTimer); carouselTimer = null; }
-              stopAllVideosExcept(-1);
-
-              if (items.length > 1){
-                items[currentIndex].classList.remove('active');
-                currentIndex = (currentIndex + 1) % items.length;
-                items[currentIndex].classList.add('active');
-              }
-              startCurrent();
-            }
-
-            // ==== Interval tekshiruvi: PLAYBACK + AUDIBLE retry + stall kicker
-            const lastProgress = new WeakMap();
-
-            function kickPlay(v, wantAudible){
-              if (!v) return;
-              if (v.readyState === 0) { try { v.load(); } catch(e){} }
-              safePlay(v, wantAudible); // safePlay ichida audible bloklansa mutedga qaytadi
-            }
-
-            function enforceAudioAndPlayback(){
-              items.forEach((item, idx) => {
-                if (item.dataset.type !== 'video') return;
-                const v = item.querySelector('video');
-                if (!v) return;
-
-                tagAudioPresence(v);
-                const wantAudible = hasAudio(v);
-
-                if (idx !== currentIndex){
-                  if (!v.muted) hardMute(v);
-                  if (!v.paused){ v.pause(); v.currentTime = 0; }
-                  return;
-                }
-
-                // Aktiv: audible kerak bo‘lsa va avval bloklangan bo‘lsa – urinish
-                if (wantAudible && (v.muted || needsAudibleRetry.get(v) === true)){
-                  tryMakeAudible(v);
-                }
-
-                // PLAYBACK stall bo‘lsa tepamiz
-                const last = lastProgress.get(v) || 0;
-                const stalled = Date.now() - last > 1500;
-                if (!isActuallyPlaying(v) || stalled){
-                  kickPlay(v, wantAudible);
-                }
-              });
-            }
-
-            // progress metrikasi
-            document.querySelectorAll('video').forEach(v => {
-              v.addEventListener('loadedmetadata', () => tagAudioPresence(v));
-              v.addEventListener('playing',        () => { tagAudioPresence(v); lastProgress.set(v, Date.now()); needsAudibleRetry.set(v, false); });
-              v.addEventListener('timeupdate',     () => { lastProgress.set(v, Date.now()); });
-              v.addEventListener('progress',       () => { lastProgress.set(v, Date.now()); });
-            });
-
-            // Visibility
-            document.addEventListener('visibilitychange', () => {
-              const item = items[currentIndex];
-              if (!item || item.dataset.type !== 'video') return;
-              const v = item.querySelector('video');
-              if (!v) return;
-              if (document.hidden) v.pause();
-              else kickPlay(v, hasAudio(v));
-            });
-
-            // Video error – keyingisiga o‘tish
-            document.addEventListener('error', function(e) {
-              if (e.target && e.target.tagName === 'VIDEO') {
-                const currentItem = items[currentIndex];
-                if (currentItem && currentItem.querySelector('video') === e.target) {
+            }    
+              
+            function startCarousel() {
+              if (items.length === 0) return;
+              
+              async function showNextItem() {
+                  // Clear any existing timer
+                  if (carouselTimer) {
+                      clearTimeout(carouselTimer);
+                      carouselTimer = null;
+                  }
+                  
+                  // Stop all videos before switching
+                  stopAllVideosExcept(-1);
+                  
+                  // Switch to next item
                   if (items.length > 1) {
-                    setTimeout(() => {
                       items[currentIndex].classList.remove('active');
                       currentIndex = (currentIndex + 1) % items.length;
                       items[currentIndex].classList.add('active');
-                      startCurrent();
-                    }, 1000);
                   }
-                }
+                  
+                  const currentItem = items[currentIndex];
+                  const isVideo = currentItem.dataset.type === 'video';
+                  
+                  if (isVideo) {
+                      const video = currentItem.querySelector('video');
+                      if (video) {
+                          const playSuccess = await playVideo(video);
+                          
+                          if (playSuccess) {
+                              // Set up end handler for this specific video
+                              video.onended = () => {
+                                  if (items.length > 1) {
+                                      showNextItem();
+                                  } else {
+                                      // Single video loop
+                                      video.currentTime = 0;
+                                      playVideo(video);
+                                  }
+                              };
+                          } else {
+                              // If video fails, move to next after delay
+                              if (items.length > 1) {
+                                  carouselTimer = setTimeout(showNextItem, 3000);
+                              }
+                          }
+                      }
+                  } else {
+                      // Image - set timer for next item
+                      if (items.length > 1) {
+                          carouselTimer = setTimeout(showNextItem, transitionTime);
+                      }
+                  }
               }
-            }, true);
-
-            // BFCache/reload – agressiv ishga tushirish
-            window.addEventListener('pageshow', () => {
-              setTimeout(() => {
-                const item = items[currentIndex] || items[0];
-                if (item && item.dataset.type === 'video') {
-                  const v = item.querySelector('video');
-                  kickPlay(v, hasAudio(v));
+  
+              async function initializeCarousel() {
+                // Ensure all videos are stopped initially
+                stopAllVideosExcept(0);
+                
+                const firstItem = items[0];
+                if (firstItem.dataset.type === 'video') {
+                    const video = firstItem.querySelector('video');
+                    if (video) {
+                        const playSuccess = await playVideo(video);
+                        if (playSuccess) {
+                            video.onended = () => {
+                                if (items.length > 1) {
+                                    showNextItem();
+                                } else {
+                                    video.currentTime = 0;
+                                    playVideo(video);
+                                }
+                            };
+                        } else if (items.length > 1) {
+                            carouselTimer = setTimeout(showNextItem, 3000);
+                        }
+                    }
+                } else if (items.length > 1) {
+                    carouselTimer = setTimeout(showNextItem, transitionTime);
                 }
-              }, 200);
-            });
-            window.addEventListener('load', () => {
-              setTimeout(() => {
-                const item = items[currentIndex] || items[0];
-                if (item) {
-                  if (!item.classList.contains('active')) item.classList.add('active');
-                  if (item.dataset.type === 'video') {
-                    const v = item.querySelector('video');
-                    kickPlay(v, hasAudio(v));
+            }
+            
+            initializeCarousel();
+        }
+
+        function handleUserInteraction() {
+          if (!userHasInteracted) {
+              userHasInteracted = true;
+              localStorage.setItem("videoSoundAllowed", "true");
+              
+              // If current item is a video, unmute it
+              const currentItem = items[currentIndex];
+              if (currentItem && currentItem.dataset.type === 'video') {
+                  const video = currentItem.querySelector('video');
+                  if (video && !video.paused) {
+                      video.muted = false;
                   }
-                }
-              }, 300);
-            });
-
-            // Start
-            document.addEventListener('DOMContentLoaded', () => {
-              setTimeout(() => {
-                if (items.length){
-                  items[0].classList.add('active');
-                  currentIndex = 0;
-                  stopAllVideosExcept(0);
-                  startCurrent();
-                }
-                setInterval(enforceAudioAndPlayback, POLL_MS);
-              }, 300);
-            });
-
-
-            /* ====== ADMIN / ASSIGN UI (o'zgartirilmagan) ====== */
-            function openControlModal(){ document.getElementById('controlModal').style.display = 'block'; }
-            function closeControlModal(){
-              document.getElementById('controlModal').style.display = 'none';
-              document.getElementById('authSection').style.display = 'block';
-              document.getElementById('mediaSelection').style.display = 'none';
-              document.getElementById('adminPassword').value = '';
-              document.getElementById('authError').style.display = 'none';
-            }
-            async function authenticate(){
-              const password = document.getElementById('adminPassword').value;
-              try{
-                const r = await fetch('/api/authenticate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});
-                const result = await r.json();
-                if (result.success){
-                  document.getElementById('authSection').style.display = 'none';
-                  document.getElementById('mediaSelection').style.display = 'block';
-                  await loadMediaList();
-                } else document.getElementById('authError').style.display = 'block';
-              }catch(e){ console.error('Authentication error:', e); }
-            }
-            async function loadMediaList(){
-              try{
-                const r = await fetch('/api/tv/${tvId}/media');
-                const data = await r.json();
-                const availableList = document.getElementById('availableMediaList');
-                const assignedList  = document.getElementById('assignedMediaList');
-                availableList.innerHTML = ''; assignedList.innerHTML = '';
-
-                const assignedIds = data.assignedMedia.map(am => am.media_id);
-                const availableMedia = data.allMedia.filter(m => !assignedIds.includes(m.id));
-                availableMedia.forEach(media => {
-                  const item = createMediaAssignmentItem(media, false);
-                  availableList.appendChild(item);
-                });
-
-                const assignedMediaWithOrder = data.assignedMedia
-                  .map(am => ({ ...data.allMedia.find(m => m.id === am.media_id), display_order: am.display_order }))
-                  .filter(m => m && m.id)
-                  .sort((a,b)=>a.display_order - b.display_order);
-                assignedMediaWithOrder.forEach(media => {
-                  const item = createMediaAssignmentItem(media, true);
-                  assignedList.appendChild(item);
-                });
-
-                initializeSortable();
-              }catch(e){ console.error('Error loading media list:', e); }
-            }
-            function createMediaAssignmentItem(media, isAssigned){
-              const item = document.createElement('div');
-              item.className = 'media-assignment-item';
-              item.setAttribute('data-id', media.id);
-              const safeOriginal = String(media.original_name || '').replace(/"/g,'&quot;');
-              const mediaElement =
-                media.file_type === 'image'
-                  ? '<img src="/uploads/'+media.filename+'" alt="'+safeOriginal+'">'
-                  : '<video src="/uploads/'+media.filename+'" muted playsinline preload="metadata">' +
-                      '<source src="/uploads/'+media.filename+'" type="video/'+(media.filename.split(".").pop())+'">' +
-                    '</video>';
-              item.innerHTML =
-                '<span class="drag-handle">⋮⋮</span>'+mediaElement+
-                '<div class="media-assignment-info"><strong>'+safeOriginal+'</strong>'+
-                '<small>'+String(media.file_type||'').toUpperCase()+' - '+(media.file_size/1024/1024).toFixed(2)+' MB</small></div>'+
-                '<div class="assignment-actions"><button onclick="'+(isAssigned?'removeFromTV':'addToTV')+'('+media.id+')" class="btn '+(isAssigned?'btn-danger':'btn-success')+'">'+(isAssigned?'Remove':'Add')+'</button></div>';
-              return item;
-            }
-            let availableSortable = null, assignedSortable = null;
-            function initializeSortable(){
-              const availableList = document.getElementById('availableMediaList');
-              const assignedList  = document.getElementById('assignedMediaList');
-              if (availableSortable){ availableSortable.destroy(); availableSortable=null; }
-              if (assignedSortable){  assignedSortable.destroy();  assignedSortable=null; }
-              availableSortable = Sortable.create(availableList, {
-                group:'tvMedia', animation:150, ghostClass:'sortable-ghost', chosenClass:'sortable-chosen', handle:'.drag-handle',
-                onAdd: evt => updateItemActions(evt.item, false)
-              });
-              assignedSortable = Sortable.create(assignedList, {
-                group:'tvMedia', animation:150, ghostClass:'sortable-ghost', chosenClass:'sortable-chosen', handle:'.drag-handle',
-                onAdd: evt => updateItemActions(evt.item, true),
-                onEnd: () => {/* reorder ok */}
-              });
-            }
-            function updateItemActions(item, isAssigned){
-              const button = item.querySelector('button');
-              const mediaId = item.getAttribute('data-id');
-              if (isAssigned){ button.textContent='Remove'; button.className='btn btn-danger'; button.setAttribute('onclick','removeFromTV('+mediaId+')'); }
-              else { button.textContent='Add'; button.className='btn btn-success'; button.setAttribute('onclick','addToTV('+mediaId+')'); }
-            }
-            function addToTV(mediaId){
-              const availableList = document.getElementById('availableMediaList');
-              const assignedList  = document.getElementById('assignedMediaList');
-              const item = availableList.querySelector('[data-id="'+mediaId+'"]');
-              if (item){ assignedList.appendChild(item); updateItemActions(item, true); }
-            }
-            function removeFromTV(mediaId){
-              const availableList = document.getElementById('availableMediaList');
-              const assignedList  = document.getElementById('assignedMediaList');
-              const item = assignedList.querySelector('[data-id="'+mediaId+'"]');
-              if (item){ availableList.appendChild(item); updateItemActions(item, false); }
-            }
-            async function saveMediaSelection(){
-              const assignedList = document.getElementById('assignedMediaList');
-              const assignments = {};
-              document.querySelectorAll('.media-assignment-item').forEach(item => { assignments[item.getAttribute('data-id')] = false; });
-              Array.from(assignedList.children).forEach((item, index) => { assignments[item.getAttribute('data-id')] = { assigned:true, order:index }; });
-              try{
-                const r = await fetch('/api/tv/${tvId}/media',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({assignments})});
-                if (r.ok){ alert('Media assignments saved! Page will reload.'); location.reload(); }
-                else { alert('Error saving media assignments'); }
-              }catch(e){ console.error('Error saving media selection:', e); alert('Error saving media assignments'); }
-            }
-            async function updateTiming(){
-              const newTime = document.getElementById('transitionTime').value * 1000;
-              try{
-                const r = await fetch('/api/tv/${tvId}/timing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transitionTime:newTime})});
-                if (r.ok){ transitionTime = newTime; alert('Timing updated!'); } else { alert('Error updating timing'); }
-              }catch(e){ console.error('Error updating timing:', e); alert('Error updating timing'); }
-            }
-            window.onclick = function(e){ const modal = document.getElementById('controlModal'); if (e.target === modal) closeControlModal(); };
-          </script>
-
-          <script>
-            // Service Worker ro'yxatdan o'tkazish va TV media fayllarini oldindan keshga tushirish
-            if ('serviceWorker' in navigator) {
-              navigator.serviceWorker.register('/sw.js')
-                .then(() => navigator.serviceWorker.ready)
-                .then(reg => {
-                  if (reg.active) {
-                    reg.active.postMessage({ type: 'PRECACHE_TV', tvId: '${tv.id}' });
-                  }
-                })
-                .catch(console.warn);
-            }
-
-            // Ixtiyoriy: precache tugagani haqida xabar olish
-            navigator.serviceWorker?.addEventListener?.('message', (e) => {
-              if (e.data?.type === 'PRECACHE_DONE') {
-                console.log('✅ Precached media for TV', e.data.tvId, 'count=', e.data.count);
               }
+          }
+      }
+
+      document.addEventListener('click', handleUserInteraction);
+        document.addEventListener('keydown', handleUserInteraction);
+        document.addEventListener('touchstart', handleUserInteraction);
+
+        if (localStorage.getItem("videoSoundAllowed") === "true") {
+          userHasInteracted = true;
+      }
+
+              
+              function openControlModal() {
+                  document.getElementById('controlModal').style.display = 'block';
+              }
+              
+              function closeControlModal() {
+                  document.getElementById('controlModal').style.display = 'none';
+                  document.getElementById('authSection').style.display = 'block';
+                  document.getElementById('mediaSelection').style.display = 'none';
+                  document.getElementById('adminPassword').value = '';
+                  document.getElementById('authError').style.display = 'none';
+              }
+              
+              async function authenticate() {
+                  const password = document.getElementById('adminPassword').value;
+                  try {
+                      const response = await fetch('/api/authenticate', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ password })
+                      });
+                      
+                      const result = await response.json();
+                      if (result.success) {
+                          document.getElementById('authSection').style.display = 'none';
+                          document.getElementById('mediaSelection').style.display = 'block';
+                          await loadMediaList();
+                      } else {
+                          document.getElementById('authError').style.display = 'block';
+                      }
+                  } catch (error) {
+                      console.error('Authentication error:', error);
+                  }
+              }
+              
+              async function loadMediaList() {
+                  try {
+                      const response = await fetch('/api/tv/${tvId}/media');
+                      const data = await response.json();
+                      
+                      const availableList = document.getElementById('availableMediaList');
+                      const assignedList = document.getElementById('assignedMediaList');
+                      
+                      availableList.innerHTML = '';
+                      assignedList.innerHTML = '';
+                      
+                      const assignedIds = data.assignedMedia.map(am => am.media_id);
+                      
+                      const availableMedia = data.allMedia.filter(m => !assignedIds.includes(m.id));
+                      availableMedia.forEach(media => {
+                          const item = createMediaAssignmentItem(media, false);
+                          availableList.appendChild(item);
+                      });
+                      
+                      const assignedMediaWithOrder = data.assignedMedia
+                          .map(am => ({
+                              ...data.allMedia.find(m => m.id === am.media_id),
+                              display_order: am.display_order
+                          }))
+                          .filter(m => m && m.id) 
+                          .sort((a, b) => a.display_order - b.display_order);
+                      
+                      assignedMediaWithOrder.forEach(media => {
+                          const item = createMediaAssignmentItem(media, true);
+                          assignedList.appendChild(item);
+                      });
+                      
+                      initializeSortable();
+                      
+                  } catch (error) {
+                      console.error('Error loading media list:', error);
+                  }
+              }
+              
+              function createMediaAssignmentItem(media, isAssigned) {
+                  const item = document.createElement('div');
+                  item.className = 'media-assignment-item';
+                  item.setAttribute('data-id', media.id);
+                  
+                  const mediaElement = media.file_type === 'image' 
+                      ? \`<img src="/uploads/\${media.filename}" alt="\${media.original_name}">\`
+                      : \`<video src="/uploads/\${media.filename}" muted>
+                           <source src="/uploads/\${media.filename}" type="video/\${media.filename.split('.').pop()}">
+                         </video>\`;
+                  
+                  item.innerHTML = \`
+                      <span class="drag-handle">⋮⋮</span>
+                      \${mediaElement}
+                      <div class="media-assignment-info">
+                          <strong>\${media.original_name}</strong>
+                          <small>\${media.file_type.toUpperCase()} - \${(media.file_size/1024/1024).toFixed(2)} MB</small>
+                      </div>
+                      <div class="assignment-actions">
+                          <button onclick="\${isAssigned ? 'removeFromTV' : 'addToTV'}(\${media.id})" 
+                                  class="btn \${isAssigned ? 'btn-danger' : 'btn-success'}">
+                              \${isAssigned ? 'Remove' : 'Add'}
+                          </button>
+                      </div>
+                  \`;
+                  
+                  return item;
+              }
+              
+              function initializeSortable() {
+                  const availableList = document.getElementById('availableMediaList');
+                  const assignedList = document.getElementById('assignedMediaList');
+                  
+                  if (availableSortable) {
+                      availableSortable.destroy();
+                      availableSortable = null;
+                  }
+                  if (assignedSortable) {
+                      assignedSortable.destroy();
+                      assignedSortable = null;
+                  }
+                  
+                  availableSortable = Sortable.create(availableList, {
+                      group: 'tvMedia',
+                      animation: 150,
+                      ghostClass: 'sortable-ghost',
+                      chosenClass: 'sortable-chosen',
+                      handle: '.drag-handle',
+                      onAdd: function(evt) {
+                          updateItemActions(evt.item, false);
+                      }
+                  });
+                  
+                  assignedSortable = Sortable.create(assignedList, {
+                      group: 'tvMedia',
+                      animation: 150,
+                      ghostClass: 'sortable-ghost',
+                      chosenClass: 'sortable-chosen',
+                      handle: '.drag-handle',
+                      onAdd: function(evt) {
+                          updateItemActions(evt.item, true);
+                      },
+                      onEnd: function(evt) {
+                          if (evt.from === evt.to) {
+                              console.log('Reordered within assigned list');
+                          }
+                      }
+                  });
+              }
+              
+              function updateItemActions(item, isAssigned) {
+                  const button = item.querySelector('button');
+                  const mediaId = item.getAttribute('data-id');
+                  
+                  if (isAssigned) {
+                      button.textContent = 'Remove';
+                      button.className = 'btn btn-danger';
+                      button.setAttribute('onclick', \`removeFromTV(\${mediaId})\`);
+                  } else {
+                      button.textContent = 'Add';
+                      button.className = 'btn btn-success';
+                      button.setAttribute('onclick', \`addToTV(\${mediaId})\`);
+                  }
+              }
+              
+              function addToTV(mediaId) {
+                  const availableList = document.getElementById('availableMediaList');
+                  const assignedList = document.getElementById('assignedMediaList');
+                  const item = availableList.querySelector(\`[data-id="\${mediaId}"]\`);
+                  
+                  if (item) {
+                      assignedList.appendChild(item);
+                      updateItemActions(item, true);
+                  }
+              }
+              
+              function removeFromTV(mediaId) {
+                  const availableList = document.getElementById('availableMediaList');
+                  const assignedList = document.getElementById('assignedMediaList');
+                  const item = assignedList.querySelector(\`[data-id="\${mediaId}"]\`);
+                  
+                  if (item) {
+                      availableList.appendChild(item);
+                      updateItemActions(item, false);
+                  }
+              }
+              
+              async function saveMediaSelection() {
+                  const assignedList = document.getElementById('assignedMediaList');
+                  const assignments = {};
+                  
+                  const allItems = document.querySelectorAll('.media-assignment-item');
+                  allItems.forEach(item => {
+                      assignments[item.getAttribute('data-id')] = false;
+                  });
+                  
+                  Array.from(assignedList.children).forEach((item, index) => {
+                      const mediaId = item.getAttribute('data-id');
+                      assignments[mediaId] = { assigned: true, order: index };
+                  });
+                  
+                  try {
+                      const response = await fetch('/api/tv/${tvId}/media', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ assignments })
+                      });
+                      
+                      if (response.ok) {
+                          alert('Media assignments saved! Page will reload to show changes.');
+                          location.reload();
+                      } else {
+                          alert('Error saving media assignments');
+                      }
+                  } catch (error) {
+                      console.error('Error saving media selection:', error);
+                      alert('Error saving media assignments');
+                  }
+              }
+              
+              async function updateTiming() {
+                  const newTime = document.getElementById('transitionTime').value * 1000;
+                  try {
+                      const response = await fetch('/api/tv/${tvId}/timing', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ transitionTime: newTime })
+                      });
+                      
+                      if (response.ok) {
+                          transitionTime = newTime;
+                          alert('Timing updated!');
+                      } else {
+                          alert('Error updating timing');
+                      }
+                  } catch (error) {
+                      console.error('Error updating timing:', error);
+                      alert('Error updating timing');
+                  }
+              }
+              
+              window.onclick = function(event) {
+                  const modal = document.getElementById('controlModal');
+                  if (event.target === modal) {
+                      closeControlModal();
+                  }
+              }
+
+              document.addEventListener("DOMContentLoaded", () => {
+                const videos = document.querySelectorAll("video");
+              
+                // Agar oldin ruxsat berilgan bo'lsa, darhol ovozni yoqamiz
+                if (localStorage.getItem("videoSoundAllowed") === "true") {
+                  videos.forEach(video => {
+                    video.muted = false;
+                    video.play().catch(err => console.warn("Autoplay with sound failed:", err));
+                  });
+                } else {
+                  // Avval muted holda autoplay
+                  videos.forEach(video => {
+                    video.muted = true;
+                    video.play().catch(err => console.warn("Muted autoplay failed:", err));
+                  });
+              
+                  // Birinchi user interaction bo'lganda ovoz yoqiladi
+                  const enableSound = () => {
+                    videos.forEach(video => {
+                      video.muted = false;
+                      video.play().catch(err => console.warn("Play with sound failed:", err));
+                    });
+                    localStorage.setItem("videoSoundAllowed", "true");
+                    document.removeEventListener("click", enableSound);
+                    document.removeEventListener("keydown", enableSound);
+                  };
+              
+                  document.addEventListener("click", enableSound);
+                  document.addEventListener("keydown", enableSound);
+                }
+              });
+              
+              window.addEventListener("load", () => {
+                const currentItem = items[currentIndex];
+                if (currentItem.dataset.type === "video") {
+                  const video = currentItem.querySelector("video");
+                  if (video) {
+                    video.play().catch(err => console.warn("Video play failed after reload:", err));
+                  }
+                }
+              });
+                     
+              document.addEventListener("click", () => {
+                const videos = document.querySelectorAll("video");
+                videos.forEach(video => {
+                  video.muted = false;
+                  video.play().catch(err => console.warn("Play with sound failed:", err));
+                });
+              }, { once: true });
+              
+              
+              document.addEventListener('DOMContentLoaded', function() {
+                // Small delay to ensure everything is loaded
+                setTimeout(() => {
+                    startCarousel();
+                }, 500);
+            });
+              
+            document.addEventListener('error', function(e) {
+              if (e.target.tagName === 'VIDEO') {
+                  console.error('Video error:', e.target.src);
+                  // If it's the current video, try to move to next item
+                  const currentItem = items[currentIndex];
+                  if (currentItem && currentItem.querySelector('video') === e.target) {
+                      if (items.length > 1) {
+                          setTimeout(() => {
+                              items[currentIndex].classList.remove('active');
+                              currentIndex = (currentIndex + 1) % items.length;
+                              items[currentIndex].classList.add('active');
+                              startCarousel();
+                          }, 1000);
+                      }
+                  }
+              }
+          }, true);
+              
+              document.addEventListener('visibilitychange', function() {
+                if (document.hidden) {
+                    // Page hidden - pause current video
+                    const currentItem = items[currentIndex];
+                    if (currentItem && currentItem.dataset.type === 'video') {
+                        const video = currentItem.querySelector('video');
+                        if (video) {
+                            video.pause();
+                        }
+                    }
+                } else {
+                    // Page visible - resume current video
+                    const currentItem = items[currentIndex];
+                    if (currentItem && currentItem.dataset.type === 'video') {
+                        const video = currentItem.querySelector('video');
+                        if (video && video.paused) {
+                            playVideo(video);
+                        }
+                    }
+                }
             });
           </script>
-
+          
       </body>
       </html>
     `);
@@ -2585,9 +2687,6 @@ app.get("/", (req, res) => {
 
 // Admin login page
 app.get("/admin/login", (req, res) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
   if (req.session.isAdmin) {
     return res.redirect("/admin");
   }
@@ -2688,9 +2787,6 @@ app.get("/admin/login", (req, res) => {
 
 // Admin login POST
 app.post("/admin/login", async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
   try {
     const { username, password } = req.body;
     const result = await pool.query(
@@ -2960,7 +3056,6 @@ app.post("/api/tv/:tvId/reorder", requireAuth, async (req, res) => {
 
 // Enhanced TV media API route with better error handling
 app.get("/api/tv/:tvId/media", async (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
   try {
     const tvId = req.params.tvId;
 
@@ -3198,107 +3293,56 @@ app.delete("/admin/media/:id", requireAuth, async (req, res) => {
 app.get("/uploads/:filename", (req, res) => {
   const filename = req.params.filename;
   const filePath = path.join(__dirname, "uploads", filename);
-  
+
   // Check if file exists
   if (!fs.existsSync(filePath)) {
     return res.status(404).send("File not found");
   }
-  
+
+  // Get file stats
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
-  const ext = path.extname(filename).toLowerCase();
   const range = req.headers.range;
-  
-  // Determine content type
-  const mimeTypes = {
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.png': 'image/png',
-    '.gif': 'image/gif',
-    '.webp': 'image/webp',
-    '.mp4': 'video/mp4',
-    '.webm': 'video/webm',
-    '.avi': 'video/x-msvideo',
-    '.mov': 'video/quicktime',
-    '.wmv': 'video/x-ms-wmv'
-  };
-  
-  const contentType = mimeTypes[ext] || 'application/octet-stream';
-  const isVideo = contentType.startsWith('video/');
-  
-  // Generate ETag
-  const etag = `"${stat.mtime.getTime()}-${fileSize}"`;
-  
-  // Check if client has cached version (for non-range requests)
-  if (!range) {
-    const ifNoneMatch = req.headers['if-none-match'];
-    const ifModifiedSince = req.headers['if-modified-since'];
-    
-    if (ifNoneMatch === etag || 
-        (ifModifiedSince && new Date(ifModifiedSince) >= stat.mtime)) {
-      return res.status(304).end();
-    }
-  }
-  
-  // Handle range requests for videos (critical for Safari/iOS/WebOS)
-  if (range && isVideo) {
+
+  // Handle video streaming with range requests
+  if (range) {
     const parts = range.replace(/bytes=/, "").split("-");
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunksize = (end - start) + 1;
-    
+    const chunksize = end - start + 1;
     const file = fs.createReadStream(filePath, { start, end });
-    
     const head = {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunksize,
-      'Content-Type': contentType,
-      'Cache-Control': 'public, max-age=3600, must-revalidate',
-      'ETag': etag,
-      'Last-Modified': stat.mtime.toUTCString(),
-      // Safari/iOS specific headers
-      'X-Content-Type-Options': 'nosniff',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-      'Access-Control-Allow-Headers': 'Range'
+      "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+      "Accept-Ranges": "bytes",
+      "Content-Length": chunksize,
+      "Content-Type": getContentType(filename),
     };
-    
     res.writeHead(206, head);
     file.pipe(res);
-    
   } else {
-    // Regular file serving (images or full video without range)
+    // Regular file serving with caching
     const head = {
-      'Content-Length': fileSize,
-      'Content-Type': contentType,
-      'Cache-Control': isVideo 
-        ? 'public, max-age=3600, must-revalidate' 
-        : 'public, max-age=86400, immutable',
-      'ETag': etag,
-      'Last-Modified': stat.mtime.toUTCString(),
-      'Accept-Ranges': isVideo ? 'bytes' : 'none',
-      'Vary': 'Accept-Encoding' + (isVideo ? ', Range' : ''),
+      "Content-Length": fileSize,
+      "Content-Type": getContentType(filename),
+      "Cache-Control": "public, max-age=86400", // 24 hours
+      ETag: `"${stat.mtime.getTime()}-${fileSize}"`,
+      "Last-Modified": stat.mtime.toUTCString(),
     };
-    
-    // Add CORS for videos
-    if (isVideo) {
-      head['Access-Control-Allow-Origin'] = '*';
-      head['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS';
-      head['Access-Control-Allow-Headers'] = 'Range';
-      head['X-Content-Type-Options'] = 'nosniff';
+
+    // Check if client has cached version
+    const ifNoneMatch = req.headers["if-none-match"];
+    const ifModifiedSince = req.headers["if-modified-since"];
+
+    if (
+      ifNoneMatch === head.ETag ||
+      (ifModifiedSince && new Date(ifModifiedSince) >= stat.mtime)
+    ) {
+      return res.status(304).end();
     }
-    
+
     res.writeHead(200, head);
     fs.createReadStream(filePath).pipe(res);
   }
-});
-
-app.get('/sw.js', (req, res) => {
-  res.setHeader('Content-Type', 'application/javascript');
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.setHeader('Service-Worker-Allowed', '/'); // 🔑 scope: /
-  res.sendFile(path.join(__dirname, 'public', 'sw.js'));
 });
 
 // Helper function to get content type
