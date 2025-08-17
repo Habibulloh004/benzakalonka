@@ -10,40 +10,28 @@ const dotenv = require("dotenv");
 
 dotenv.config();
 
-// === uploads dir: env orqali boshqarish + yozish huquqini tekshirish ===
-const UPLOADS_DIR = process.env.UPLOADS_DIR || path.resolve(__dirname, "uploads");
-
-// create dir (775) va yozish huquqini tekshirish
-try {
-  if (!fs.existsSync(UPLOADS_DIR)) {
-    fs.mkdirSync(UPLOADS_DIR, { recursive: true, mode: 0o775 });
-  } else {
-    // mavjud bo'lsa ham, ruxsatni kengaytirib qo'yamiz (umask ta'sir qilmasligi uchun)
-    try { fs.chmodSync(UPLOADS_DIR, 0o775); } catch (_) {}
-  }
-  fs.accessSync(UPLOADS_DIR, fs.constants.W_OK);
-  console.log("✅ Uploads dir:", UPLOADS_DIR, "writable");
-} catch (e) {
-  console.error("❌ Uploads dir not writable:", UPLOADS_DIR, e.message);
-  console.error("   Fix ownership/permissions or set UPLOADS_DIR env.");
-  process.exit(1);
-}
-
-// Multer shu pathdan foydalansin
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || "").toLowerCase();
-    const name = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-    cb(null, name);
-  },
-});
-
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(compression());
+const shouldCompress = (req, res) => {
+  if (req.path.startsWith('/admin/upload')) return false; // upload POST
+  if (req.path.startsWith('/uploads')) return false;      // media stream
+  return compression.filter(req, res);
+};
+app.use(compression({ filter: shouldCompress }));
+
+app.use((req, res, next) => {
+  // request/response socket timeoutlarini o'chirish
+  req.setTimeout(0);
+  res.setTimeout(0);
+  next();
+});
+
+app.use("/public", express.static(path.join(__dirname, "public"), {
+  etag: true,
+  maxAge: "1d",
+  immutable: false
+}));
 
 // Database configuration
 const pool = new Pool({
@@ -54,14 +42,12 @@ const pool = new Pool({
   port: process.env.DB_PORT || 5432,
 });
 
-// ✅ MEDIA (rasm/video) uchun kuchli kesh + Range qo'llab-quvvatlash
 app.head("/uploads/:filename", mediaHandler); // HEAD
 app.get("/uploads/:filename", mediaHandler);  // GET
 
 function mediaHandler(req, res) {
   const filename = req.params.filename;
   const filePath = path.join(__dirname, "uploads", filename);
-
   if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
 
   const stat = fs.statSync(filePath);
@@ -77,82 +63,61 @@ function mediaHandler(req, res) {
   const isVideo = mime.startsWith("video/");
   const isImage = mime.startsWith("image/");
 
-  // ETag (weak) + Last-Modified
-  const etag = `W/"${stat.mtime.getTime()}-${size}"`;
+  const etag = `"${stat.mtime.getTime()}-${size}"`; 
   const lastMod = stat.mtime.toUTCString();
 
-  // Rasmlar: fayl nomlari random/unique bo'lgani uchun 1 yil + immutable
-  // Videolar: 1 soat + must-revalidate (range oqimida xavfsizroq)
-  const cacheCtl = isImage
-    ? "public, max-age=31536000, immutable"
-    : isVideo
-      ? "public, max-age=3600, must-revalidate"
-      : "public, max-age=86400, must-revalidate";
+  const cacheCtl = (isImage || isVideo)
+  ? "public, max-age=31536000, immutable"
+  : "public, max-age=86400, must-revalidate";
 
-  // 304 sharti (range bo'lmaganda)
-  if (!range && req.method !== "HEAD") {
-    const inm = req.headers["if-none-match"];
-    const ims = req.headers["if-modified-since"];
-    if (inm === etag || (ims && new Date(ims) >= stat.mtime)) {
-      res.writeHead(304, {
-        "Cache-Control": cacheCtl,
-        "ETag": etag,
-        "Last-Modified": lastMod,
-        "Content-Type": mime,
-        "Accept-Ranges": isVideo ? "bytes" : "none",
-        "X-Content-Type-Options": "nosniff",
-      });
-      return res.end();
-    }
-  }
-
-  // HEAD – faqat header
-  if (req.method === "HEAD") {
-    res.writeHead(200, {
-      "Content-Length": size,
-      "Content-Type": mime,
-      "Cache-Control": cacheCtl,
-      "ETag": etag,
-      "Last-Modified": lastMod,
-      "Accept-Ranges": isVideo ? "bytes" : "none",
-      "X-Content-Type-Options": "nosniff",
-    });
-    return res.end();
-  }
-
-  // VIDEO: Range qo'llab-quvvatlash
-  if (range && isVideo) {
-    const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(startStr, 10);
-    const end = endStr ? parseInt(endStr, 10) : size - 1;
-    if (isNaN(start) || start >= size) return res.status(416).set("Content-Range", `bytes */${size}`).end();
-    const chunk = (end - start) + 1;
-
-    res.writeHead(206, {
-      "Content-Range": `bytes ${start}-${end}/${size}`,
-      "Accept-Ranges": "bytes",
-      "Content-Length": chunk,
-      "Content-Type": mime,
-      "Cache-Control": cacheCtl,
-      "ETag": etag,
-      "Last-Modified": lastMod,
-      "X-Content-Type-Options": "nosniff",
-      // CORS kerak bo'lsa yoqing:
-      // "Access-Control-Allow-Origin": "*",
-    });
-    return fs.createReadStream(filePath, { start, end }).pipe(res);
-  }
-
-  // Rasm yoki to'liq video (range-siz)
-  res.writeHead(200, {
-    "Content-Length": size,
+  // Yordamchi — har doim umumiy headerlar
+  const baseHeaders = {
     "Content-Type": mime,
     "Cache-Control": cacheCtl,
     "ETag": etag,
     "Last-Modified": lastMod,
-    "Accept-Ranges": isVideo ? "bytes" : "none",
+    "Content-Disposition": "inline",
     "X-Content-Type-Options": "nosniff",
-  });
+    "Accept-Ranges": isVideo ? "bytes" : "none",
+    "Vary": isVideo ? "Accept-Encoding, Range" : "Accept-Encoding",
+  };
+
+  // 304 (range yo‘q) — kesh tekshiruvi
+  if (!range && req.method !== "HEAD") {
+    const inm = req.headers["if-none-match"];
+    const ims = req.headers["if-modified-since"];
+    if (inm === etag || (ims && new Date(ims) >= stat.mtime)) {
+      res.writeHead(304, baseHeaders);
+      return res.end();
+    }
+  }
+
+  // HEAD
+  if (req.method === "HEAD") {
+    res.writeHead(200, { ...baseHeaders, "Content-Length": size });
+    return res.end();
+  }
+
+  // VIDEO: Range
+  if (range && isVideo) {
+    const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(startStr, 10);
+    const end = endStr ? parseInt(endStr, 10) : size - 1;
+    if (isNaN(start) || start >= size) {
+      return res.status(416).set("Content-Range", `bytes */${size}`).end();
+    }
+    const chunk = (end - start) + 1;
+
+    res.writeHead(206, {
+      ...baseHeaders,
+      "Content-Range": `bytes ${start}-${end}/${size}`,
+      "Content-Length": chunk,
+    });
+    return fs.createReadStream(filePath, { start, end }).pipe(res);
+  }
+
+  // Rasm yoki to‘liq video (range-siz)
+  res.writeHead(200, { ...baseHeaders, "Content-Length": size });
   fs.createReadStream(filePath).pipe(res);
 }
 
@@ -272,35 +237,58 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-
-// 📏 Limitlar + aniq fileFilter (mp4/mov/webm/… va rasm turlari)
-const upload = multer({
-  storage,
-  limits: {
-    files: 10,
-    fileSize: 2 * 1024 * 1024 * 1024, // 2GB
+// Multer configuration for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, "uploads/");
   },
-  fileFilter: (req, file, cb) => {
-    const okExt = /\.(jpe?g|png|gif|webp|mp4|avi|mov|wmv|webm)$/i.test(file.originalname || "");
-    const okMime = /^(image\/(jpeg|png|gif|webp)|video\/(mp4|x-msvideo|quicktime|x-ms-wmv|webm))$/i
-      .test(file.mimetype || "");
-    return (okExt && okMime)
-      ? cb(null, true)
-      : cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "Unsupported file type"));
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
   },
 });
 
-// ✅ Multer ni route ichida qo‘llab, xatoni ushlaydigan wrapper
-const uploadMiddleware = (req, res, next) => {
-  upload.array("media", 10)(req, res, (err) => {
-    if (err) {
-      console.error("Multer upload error:", err);
-      return res.redirect("/admin?upload_error=1"); // 500 o‘rniga foydalanuvchi uchun xabar
-    }
-    next();
-  });
-};
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 4 * 1024 * 1024 * 1024, // 4 GB
+    files: 20
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif|webp|mp4|avi|mov|wmv|webm|quicktime/;
+    const extname = allowedTypes.test(
+      path.extname(file.originalname).toLowerCase()
+    );
 
+    const allowedMimeTypes = [
+      "image/jpeg",
+      "image/jpg",
+      "image/png",
+      "image/gif",
+      "image/webp",
+      "video/mp4",
+      "video/avi",
+      "video/quicktime",
+      "video/x-msvideo",
+      "video/webm",
+      "video/x-ms-wmv",
+    ];
+
+    const mimetypeAllowed = allowedMimeTypes.includes(
+      file.mimetype.toLowerCase()
+    );
+
+    if (mimetypeAllowed && extname) {
+      return cb(null, true);
+    } else {
+      cb(
+        new Error(
+          "Only image (JPEG, PNG, GIF, WebP) and video (MP4, AVI, MOV, WMV, WebM) files are allowed!"
+        )
+      );
+    }
+  },
+});
 
 // Middleware to check admin authentication
 const requireAuth = (req, res, next) => {
@@ -2557,6 +2545,7 @@ app.get("/tv/:tvId", async (req, res) => {
             window.onclick = function(e){ const modal = document.getElementById('controlModal'); if (e.target === modal) closeControlModal(); };
           </script>
 
+
           <script>
             // Service Worker ro'yxatdan o'tkazish va TV media fayllarini oldindan keshga tushirish
             if ('serviceWorker' in navigator) {
@@ -3081,7 +3070,7 @@ app.post("/api/tv/:tvId/timing", async (req, res) => {
 app.post(
   "/admin/upload",
   requireAuth,
-  uploadMiddleware,
+  upload.array("media", 10),
   async (req, res) => {
     try {
       if (!req.files || req.files.length === 0) {
@@ -3205,105 +3194,105 @@ app.delete("/admin/media/:id", requireAuth, async (req, res) => {
   }
 });
 
-// Media file serving with better caching and video support
-app.get("/uploads/:filename", (req, res) => {
-  const filename = req.params.filename;
-  const filePath = path.join(__dirname, "uploads", filename);
+// // Media file serving with better caching and video support
+// app.get("/uploads/:filename", (req, res) => {
+//   const filename = req.params.filename;
+//   const filePath = path.join(__dirname, "uploads", filename);
   
-  // Check if file exists
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).send("File not found");
-  }
+//   // Check if file exists
+//   if (!fs.existsSync(filePath)) {
+//     return res.status(404).send("File not found");
+//   }
   
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-  const ext = path.extname(filename).toLowerCase();
-  const range = req.headers.range;
+//   const stat = fs.statSync(filePath);
+//   const fileSize = stat.size;
+//   const ext = path.extname(filename).toLowerCase();
+//   const range = req.headers.range;
   
-  // Determine content type
-  const mimeTypes = {
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.png': 'image/png',
-    '.gif': 'image/gif',
-    '.webp': 'image/webp',
-    '.mp4': 'video/mp4',
-    '.webm': 'video/webm',
-    '.avi': 'video/x-msvideo',
-    '.mov': 'video/quicktime',
-    '.wmv': 'video/x-ms-wmv'
-  };
+//   // Determine content type
+//   const mimeTypes = {
+//     '.jpg': 'image/jpeg',
+//     '.jpeg': 'image/jpeg',
+//     '.png': 'image/png',
+//     '.gif': 'image/gif',
+//     '.webp': 'image/webp',
+//     '.mp4': 'video/mp4',
+//     '.webm': 'video/webm',
+//     '.avi': 'video/x-msvideo',
+//     '.mov': 'video/quicktime',
+//     '.wmv': 'video/x-ms-wmv'
+//   };
   
-  const contentType = mimeTypes[ext] || 'application/octet-stream';
-  const isVideo = contentType.startsWith('video/');
+//   const contentType = mimeTypes[ext] || 'application/octet-stream';
+//   const isVideo = contentType.startsWith('video/');
   
-  // Generate ETag
-  const etag = `"${stat.mtime.getTime()}-${fileSize}"`;
+//   // Generate ETag
+//   const etag = `"${stat.mtime.getTime()}-${fileSize}"`;
   
-  // Check if client has cached version (for non-range requests)
-  if (!range) {
-    const ifNoneMatch = req.headers['if-none-match'];
-    const ifModifiedSince = req.headers['if-modified-since'];
+//   // Check if client has cached version (for non-range requests)
+//   if (!range) {
+//     const ifNoneMatch = req.headers['if-none-match'];
+//     const ifModifiedSince = req.headers['if-modified-since'];
     
-    if (ifNoneMatch === etag || 
-        (ifModifiedSince && new Date(ifModifiedSince) >= stat.mtime)) {
-      return res.status(304).end();
-    }
-  }
+//     if (ifNoneMatch === etag || 
+//         (ifModifiedSince && new Date(ifModifiedSince) >= stat.mtime)) {
+//       return res.status(304).end();
+//     }
+//   }
   
-  // Handle range requests for videos (critical for Safari/iOS/WebOS)
-  if (range && isVideo) {
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunksize = (end - start) + 1;
+//   // Handle range requests for videos (critical for Safari/iOS/WebOS)
+//   if (range && isVideo) {
+//     const parts = range.replace(/bytes=/, "").split("-");
+//     const start = parseInt(parts[0], 10);
+//     const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+//     const chunksize = (end - start) + 1;
     
-    const file = fs.createReadStream(filePath, { start, end });
+//     const file = fs.createReadStream(filePath, { start, end });
     
-    const head = {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunksize,
-      'Content-Type': contentType,
-      'Cache-Control': 'public, max-age=3600, must-revalidate',
-      'ETag': etag,
-      'Last-Modified': stat.mtime.toUTCString(),
-      // Safari/iOS specific headers
-      'X-Content-Type-Options': 'nosniff',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-      'Access-Control-Allow-Headers': 'Range'
-    };
+//     const head = {
+//       'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+//       'Accept-Ranges': 'bytes',
+//       'Content-Length': chunksize,
+//       'Content-Type': contentType,
+//       'Cache-Control': 'public, max-age=3600, must-revalidate',
+//       'ETag': etag,
+//       'Last-Modified': stat.mtime.toUTCString(),
+//       // Safari/iOS specific headers
+//       'X-Content-Type-Options': 'nosniff',
+//       'Access-Control-Allow-Origin': '*',
+//       'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+//       'Access-Control-Allow-Headers': 'Range'
+//     };
     
-    res.writeHead(206, head);
-    file.pipe(res);
+//     res.writeHead(206, head);
+//     file.pipe(res);
     
-  } else {
-    // Regular file serving (images or full video without range)
-    const head = {
-      'Content-Length': fileSize,
-      'Content-Type': contentType,
-      'Cache-Control': isVideo 
-        ? 'public, max-age=3600, must-revalidate' 
-        : 'public, max-age=86400, immutable',
-      'ETag': etag,
-      'Last-Modified': stat.mtime.toUTCString(),
-      'Accept-Ranges': isVideo ? 'bytes' : 'none',
-      'Vary': 'Accept-Encoding' + (isVideo ? ', Range' : ''),
-    };
+//   } else {
+//     // Regular file serving (images or full video without range)
+//     const head = {
+//       'Content-Length': fileSize,
+//       'Content-Type': contentType,
+//       'Cache-Control': isVideo 
+//         ? 'public, max-age=3600, must-revalidate' 
+//         : 'public, max-age=86400, immutable',
+//       'ETag': etag,
+//       'Last-Modified': stat.mtime.toUTCString(),
+//       'Accept-Ranges': isVideo ? 'bytes' : 'none',
+//       'Vary': 'Accept-Encoding' + (isVideo ? ', Range' : ''),
+//     };
     
-    // Add CORS for videos
-    if (isVideo) {
-      head['Access-Control-Allow-Origin'] = '*';
-      head['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS';
-      head['Access-Control-Allow-Headers'] = 'Range';
-      head['X-Content-Type-Options'] = 'nosniff';
-    }
+//     // Add CORS for videos
+//     if (isVideo) {
+//       head['Access-Control-Allow-Origin'] = '*';
+//       head['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS';
+//       head['Access-Control-Allow-Headers'] = 'Range';
+//       head['X-Content-Type-Options'] = 'nosniff';
+//     }
     
-    res.writeHead(200, head);
-    fs.createReadStream(filePath).pipe(res);
-  }
-});
+//     res.writeHead(200, head);
+//     fs.createReadStream(filePath).pipe(res);
+//   }
+// });
 
 app.get('/sw.js', (req, res) => {
   res.setHeader('Content-Type', 'application/javascript');
@@ -3410,14 +3399,13 @@ app.get("/admin/logout", (req, res) => {
 });
 
 // Start server and initialize database
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`👤 Admin login: http://localhost:${PORT}/admin/login`);
-  console.log("🔧 Initializing database...");
   await initializeDatabase();
   console.log("✅ Database initialization complete!");
-  console.log("\n📺 TV URLs will be available at:");
-  console.log("   http://localhost:${PORT}/tv/[TV_ID]");
-  console.log("   (TV IDs will be shown in the admin dashboard)");
 });
+server.requestTimeout = 0;   // 0 => cheksiz
+server.headersTimeout = 0;   // headerlar uchun ham
+server.keepAliveTimeout = 0; // (xohlasangiz 600000 qilib qo'yishingiz mumkin)
+server.setTimeout(0); 
 // Continue in next artifact due to length...

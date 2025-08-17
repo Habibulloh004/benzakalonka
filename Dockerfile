@@ -1,19 +1,21 @@
-# Dockerfile
 FROM node:18-alpine
 
 WORKDIR /app
 
-# package* fayllarni ko'chirib o'rnatamiz
-COPY --chown=node:node package*.json ./
-RUN npm ci --omit=dev
+# Copy package files
+COPY package*.json ./
 
-# Ilova fayllari (egasi node bo'lsin)
-COPY --chown=node:node . .
+# Install dependencies
+RUN npm install --only=production
 
-# uploads papkani yaratib, node'ga beramiz
-RUN mkdir -p /app/uploads && chown -R node:node /app
+# Copy application code
+COPY . .
 
-USER node
+# Create uploads directory
+RUN mkdir -p uploads
 
+# Expose port
 EXPOSE 3000
-CMD ["node", "server.js"]
+
+# Start the application
+CMD ["npm", "start"]
